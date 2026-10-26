@@ -1,17 +1,17 @@
+
 name: Build Kyverno Offline Bundle
 
 on:
   workflow_dispatch:
     inputs:
       chart_version:
-        description: 'Kyverno Helm chart version (leave empty for latest stable)'
-        required: false
-        type: string
+        description: 'Kyverno Helm chart version (e.g. 3.9.0)'
+        required: true
+        default: '3.9.0'
       platform:
-        description: 'Target Linux image architecture'
+        description: 'Container image platform'
         required: true
         type: choice
-        default: linux/amd64
         options:
           - linux/amd64
           - linux/arm64
@@ -20,85 +20,76 @@ permissions:
   contents: read
 
 jobs:
-  bundle:
+  offline-bundle:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v4.3.1
         with:
           version: v3.17.3
 
-      - name: Install YAML parser
-        run: python3 -m pip install --user 'PyYAML==6.0.2'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Download Helm chart
+      - name: Install parser
+        run: python -m pip install 'PyYAML==6.0.2'
+
+      - name: Download chart, render manifests and discover all images
         env:
           CHART_VERSION: ${{ inputs.chart_version }}
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p bundle
           helm repo add kyverno https://kyverno.github.io/kyverno/
           helm repo update
-          if [[ -n "$CHART_VERSION" ]]; then
-            helm pull kyverno/kyverno --version "$CHART_VERSION" --destination bundle
-          else
-            helm pull kyverno/kyverno --destination bundle
-          fi
-          CHART_TGZ=$(find bundle -maxdepth 1 -name 'kyverno-*.tgz' -print -quit)
-          test -n "$CHART_TGZ"
-          helm template kyverno "$CHART_TGZ" --namespace kyverno --include-crds > bundle/install-rendered.yaml
-          echo "Chart: $CHART_TGZ"
+          helm pull kyverno/kyverno --version "$CHART_VERSION" --destination bundle
+          mv "bundle/kyverno-${CHART_VERSION}.tgz" bundle/kyverno-chart.tgz
+          helm show values bundle/kyverno-chart.tgz > bundle/values.yaml
+          helm template kyverno bundle/kyverno-chart.tgz \
+            --namespace kyverno --include-crds > bundle/install.yaml
+          python scripts/collect-images.py bundle/install.yaml bundle/images.txt
+          test -s bundle/images.txt
+          cat bundle/images.txt
 
-      - name: Extract unique images
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import yaml
-          images = set()
-          def scan(value):
-              if isinstance(value, dict):
-                  for key, item in value.items():
-                      if key == 'image' and isinstance(item, str) and item.strip():
-                          images.add(item.strip())
-                      else:
-                          scan(item)
-              elif isinstance(value, list):
-                  for item in value:
-                      scan(item)
-          with open('bundle/install-rendered.yaml', encoding='utf-8') as f:
-              for doc in yaml.safe_load_all(f):
-                  scan(doc)
-          if not images:
-              raise SystemExit('No images found in rendered chart')
-          with open('bundle/images.txt', 'w', encoding='utf-8') as f:
-              f.write('\n'.join(sorted(images)) + '\n')
-          print(f'{len(images)} unique image references:')
-          print('\n'.join(sorted(images)))
-          PY
-
-      - name: Pull images once and create a single TAR
+      - name: Pull unique images and save a single TAR
         env:
-          TARGET_PLATFORM: ${{ inputs.platform }}
-        shell: bash
+          PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
+          while IFS= read -r image; do
+            echo "Pulling $image for $PLATFORM"
+            docker pull --platform "$PLATFORM" "$image"
+          done < bundle/images.txt
           mapfile -t images < bundle/images.txt
-          for img in "${images[@]}"; do
-            echo "Pulling $img ($TARGET_PLATFORM)"
-            docker pull --platform "$TARGET_PLATFORM" "$img"
-          done
-          docker save --output bundle/images.tar "${images[@]}"
-          echo "All unique images stored in bundle/images.tar"
-          ls -lh bundle/
+          docker save --output bundle/kyverno-images.tar "${images[@]}"
+          sha256sum bundle/kyverno-images.tar > bundle/SHA256SUMS
 
-      - name: Upload ONE offline ZIP artifact
+      - name: Add offline installation tooling
+        run: |
+          cp scripts/install-offline.sh bundle/install-offline.sh
+          cp scripts/helm-image-rewriter.py bundle/helm-image-rewriter.py
+          cp scripts/collect-images.py bundle/collect-images.py
+          cp README-offline.md bundle/README.md
+          chmod +x bundle/install-offline.sh bundle/helm-image-rewriter.py
+
+      - name: Create single ZIP
+        run: |
+          set -euo pipefail
+          (cd bundle && zip -q -0 -r ../kyverno-offline-bundle.zip .)
+          unzip -t kyverno-offline-bundle.zip
+          ls -lh kyverno-offline-bundle.zip
+
+      - name: Upload exactly one bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: kyverno-offline-bundle
-          path: bundle/
+          path: kyverno-offline-bundle.zip
           if-no-files-found: error
-          compression-level: 0
           retention-days: 7
+          compression-level: 0
