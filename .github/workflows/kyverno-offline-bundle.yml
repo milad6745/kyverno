@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       chart_version:
-        description: 'Optional exact Helm chart version; leave blank for latest chart with Kyverno appVersion 1.11.x (Kubernetes 1.25)'
+        description: 'Kyverno Helm chart version (leave empty for latest stable)'
         required: false
         type: string
       platform:
-        description: 'Container image platform'
+        description: 'Target Linux image architecture'
         required: true
-        default: 'linux/amd64'
         type: choice
+        default: linux/amd64
         options:
           - linux/amd64
           - linux/arm64
@@ -20,152 +20,85 @@ permissions:
   contents: read
 
 jobs:
-  build-offline-bundle:
+  bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Install Helm
-        uses: azure/setup-helm@v4.3.0
+        uses: azure/setup-helm@v4
         with:
           version: v3.17.3
 
-      - name: Set up dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --user --quiet PyYAML
-          helm repo add kyverno https://kyverno.github.io/kyverno/
-          helm repo update kyverno
-          mkdir -p bundle/chart bundle/manifests bundle/images bundle/metadata
+      - name: Install YAML parser
+        run: python3 -m pip install --user 'PyYAML==6.0.2'
 
-      - name: Select compatible chart and download full chart
-        id: chart
+      - name: Download Helm chart
         env:
-          INPUT_CHART_VERSION: ${{ inputs.chart_version }}
+          CHART_VERSION: ${{ inputs.chart_version }}
         shell: bash
         run: |
           set -euo pipefail
-          helm search repo kyverno/kyverno --versions -o json > /tmp/kyverno-charts.json
-          if [[ -n "$INPUT_CHART_VERSION" ]]; then
-            CHART_VERSION="$INPUT_CHART_VERSION"
-            APP_VERSION="$(jq -r --arg v "$CHART_VERSION" '.[] | select(.version == $v) | .app_version' /tmp/kyverno-charts.json | head -1)"
-            [[ -n "$APP_VERSION" ]] || { echo 'Specified chart version not found'; exit 1; }
+          mkdir -p bundle
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update
+          if [[ -n "$CHART_VERSION" ]]; then
+            helm pull kyverno/kyverno --version "$CHART_VERSION" --destination bundle
           else
-            # Choose highest chart semver among entries whose appVersion is 1.11.x.
-            CHART_VERSION="$(jq -r '.[] | select(.app_version | test("^v?1\\.11\\.")) | .version' /tmp/kyverno-charts.json | sort -V | tail -1)"
-            [[ -n "$CHART_VERSION" ]] || { echo 'No Kyverno 1.11.x chart found in repository index'; exit 1; }
-            APP_VERSION="$(jq -r --arg v "$CHART_VERSION" '.[] | select(.version == $v) | .app_version' /tmp/kyverno-charts.json | head -1)"
+            helm pull kyverno/kyverno --destination bundle
           fi
-          if ! [[ "$APP_VERSION" =~ ^v?1\.11\. ]]; then
-            echo "Refusing Kyverno $APP_VERSION: Kubernetes v1.25.6 requires an explicitly validated compatible release (default: 1.11.x)."
-            exit 1
-          fi
-          echo "Chart=$CHART_VERSION App=$APP_VERSION"
-          helm pull kyverno/kyverno --version "$CHART_VERSION" --destination bundle/chart
-          helm pull kyverno/kyverno --version "$CHART_VERSION" --untar --untardir bundle/chart
-          helm show values kyverno/kyverno --version "$CHART_VERSION" > bundle/chart/default-values.yaml
-          cp bundle/chart/default-values.yaml bundle/chart/offline-values.example.yaml
-          printf 'chart_version=%s\napp_version=%s\n' "$CHART_VERSION" "$APP_VERSION" > bundle/metadata/versions.txt
-          echo "chart_version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          CHART_TGZ=$(find bundle -maxdepth 1 -name 'kyverno-*.tgz' -print -quit)
+          test -n "$CHART_TGZ"
+          helm template kyverno "$CHART_TGZ" --namespace kyverno --include-crds > bundle/install-rendered.yaml
+          echo "Chart: $CHART_TGZ"
 
-      - name: Render Helm manifests and discover distinct images
+      - name: Extract unique images
         shell: bash
         run: |
           set -euo pipefail
-          helm template kyverno bundle/chart/kyverno \
-            --namespace kyverno --kube-version 1.25.6 \
-            --include-crds \
-            -f bundle/chart/default-values.yaml \
-            > bundle/manifests/rendered.yaml
-          # Extract container/initContainer/ephemeralContainer images from workload Pod specs.
           python3 - <<'PY'
           import yaml
-          from pathlib import Path
-          content = Path('bundle/manifests/rendered.yaml').read_text()
           images = set()
-          def visit(x):
-              if isinstance(x, dict):
-                  for key, value in x.items():
-                      if key in ('containers', 'initContainers', 'ephemeralContainers') and isinstance(value, list):
-                          for container in value:
-                              if isinstance(container, dict) and isinstance(container.get('image'), str):
-                                  images.add(container['image'])
-                      visit(value)
-              elif isinstance(x, list):
-                  for value in x:
-                      visit(value)
-          for resource in yaml.safe_load_all(content):
-              visit(resource)
+          def scan(value):
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      if key == 'image' and isinstance(item, str) and item.strip():
+                          images.add(item.strip())
+                      else:
+                          scan(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      scan(item)
+          with open('bundle/install-rendered.yaml', encoding='utf-8') as f:
+              for doc in yaml.safe_load_all(f):
+                  scan(doc)
           if not images:
-              raise SystemExit('No images detected in rendered manifests: refusing incomplete bundle')
-          Path('bundle/images/image-list.txt').write_text('\n'.join(sorted(images)) + '\n')
-          print('Unique image references:', len(images))
-          for item in sorted(images): print('  ', item)
+              raise SystemExit('No images found in rendered chart')
+          with open('bundle/images.txt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(sorted(images)) + '\n')
+          print(f'{len(images)} unique image references:')
+          print('\n'.join(sorted(images)))
           PY
 
-      - name: Pull unique images and create ONE Docker TAR
+      - name: Pull images once and create a single TAR
         env:
-          PLATFORM: ${{ inputs.platform }}
+          TARGET_PLATFORM: ${{ inputs.platform }}
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t IMAGES < bundle/images/image-list.txt
-          for img in "${IMAGES[@]}"; do
-            echo "Pulling: $img ($PLATFORM)"
-            docker pull --platform "$PLATFORM" "$img"
+          mapfile -t images < bundle/images.txt
+          for img in "${images[@]}"; do
+            echo "Pulling $img ($TARGET_PLATFORM)"
+            docker pull --platform "$TARGET_PLATFORM" "$img"
           done
-          # One tar containing all unique named images; no per-image tar/checksum files.
-          docker image save -o bundle/images/kyverno-images.tar "${IMAGES[@]}"
-          test -s bundle/images/kyverno-images.tar
+          docker save --output bundle/images.tar "${images[@]}"
+          echo "All unique images stored in bundle/images.tar"
+          ls -lh bundle/
 
-      - name: Add offline README and package as ONE ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > bundle/README-OFFLINE.txt <<'TXT'
-          KYVERNO OFFLINE INSTALLATION BUNDLE (for Kubernetes v1.25.6)
-
-          Contents:
-            chart/*.tgz                 Original Helm chart package
-            chart/kyverno/             Unpacked Helm chart: templates, values, CRDs
-            chart/default-values.yaml  Default values from pinned chart
-            chart/offline-values.example.yaml  Edit this copy for registry overrides
-            manifests/rendered.yaml    Rendered Kubernetes resources (reference only)
-            images/image-list.txt      Exact unique references used by rendered workloads
-            images/kyverno-images.tar  ONE Docker archive containing all discovered images
-            metadata/versions.txt      Selected chart and Kyverno app versions
-
-          On a Linux machine with Docker and access to the offline Nexus registry:
-            docker load -i images/kyverno-images.tar
-            cat images/image-list.txt
-            docker images
-
-          Retag & push EVERY image to your internal registry. Then update Helm
-          image registry/repository settings in offline-values.example.yaml.
-          Before installing, run helm template using those customized values and
-          verify ALL images (including initContainers and hooks) resolve internally.
-
-          Example after image remapping (NOT ready before values are customized):
-            helm upgrade --install kyverno ./chart/kyverno \
-              --namespace kyverno --create-namespace \
-              -f ./chart/offline-values.example.yaml
-
-          Warning: This archived Kyverno 1.11.x line is past upstream community
-          security support. Kubernetes v1.25 is also EOL. Use for lab/testing,
-          not a new production deployment.
-          TXT
-          cd bundle
-          zip -q -r -0 ../kyverno-offline-bundle.zip .
-          cd ..
-          unzip -t kyverno-offline-bundle.zip | tail -1
-          ls -lh kyverno-offline-bundle.zip
-
-      - name: Upload single ZIP artifact
+      - name: Upload ONE offline ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: kyverno-offline-bundle
-          path: kyverno-offline-bundle.zip
+          path: bundle/
           if-no-files-found: error
-          retention-days: 7
           compression-level: 0
+          retention-days: 7
