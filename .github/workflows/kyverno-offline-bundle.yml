@@ -3,93 +3,232 @@ name: Build Kyverno Offline Bundle
 
 on:
   workflow_dispatch:
-    inputs:
-      chart_version:
-        description: 'Kyverno Helm chart version (e.g. 3.9.0)'
-        required: true
-        default: '3.9.0'
-      platform:
-        description: 'Container image platform'
-        required: true
-        type: choice
-        options:
-          - linux/amd64
-          - linux/arm64
 
 permissions:
   contents: read
 
+env:
+  KYVERNO_VERSION: v1.11.4
+  OFFLINE_REGISTRY: repo.nexus.local:32082
+  OFFLINE_PREFIX: kyverno
+
 jobs:
-  offline-bundle:
+  build-offline-bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
     steps:
-      - name: Checkout scripts
-        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+          python3 -m pip install --user PyYAML
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4.3.1
-        with:
-          version: v3.17.3
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install parser
-        run: python -m pip install 'PyYAML==6.0.2'
-
-      - name: Download chart, render manifests and discover all images
-        env:
-          CHART_VERSION: ${{ inputs.chart_version }}
+      - name: Download official Kyverno manifest
+        shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p bundle
-          helm repo add kyverno https://kyverno.github.io/kyverno/
-          helm repo update
-          helm pull kyverno/kyverno --version "$CHART_VERSION" --destination bundle
-          mv "bundle/kyverno-${CHART_VERSION}.tgz" bundle/kyverno-chart.tgz
-          helm show values bundle/kyverno-chart.tgz > bundle/values.yaml
-          helm template kyverno bundle/kyverno-chart.tgz \
-            --namespace kyverno --include-crds > bundle/install.yaml
-          python scripts/collect-images.py bundle/install.yaml bundle/images.txt
-          test -s bundle/images.txt
-          cat bundle/images.txt
 
-      - name: Pull unique images and save a single TAR
-        env:
-          PLATFORM: ${{ inputs.platform }}
+          curl -fL --retry 3 \
+            "https://github.com/kyverno/kyverno/releases/download/${KYVERNO_VERSION}/install.yaml" \
+            -o bundle/install.yaml
+
+          test -s bundle/install.yaml
+
+      - name: Extract unique images and prepare offline manifest
+        shell: bash
         run: |
           set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import yaml
+          import hashlib
+          from pathlib import Path
+
+          bundle = Path("bundle")
+          manifest = bundle / "install.yaml"
+
+          registry = os.environ["OFFLINE_REGISTRY"].rstrip("/")
+          prefix = os.environ["OFFLINE_PREFIX"].strip("/")
+
+          with manifest.open() as f:
+              documents = list(yaml.safe_load_all(f))
+
+          images = set()
+
+          def collect(obj):
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      if key == "image" and isinstance(value, str):
+                          images.add(value)
+                      else:
+                          collect(value)
+              elif isinstance(obj, list):
+                  for item in obj:
+                      collect(item)
+
+          for document in documents:
+              collect(document)
+
+          if not images:
+              raise RuntimeError("No images found in manifest")
+
+          mapping = {}
+
+          for source in sorted(images):
+              digest = hashlib.sha256(
+                  source.encode()
+              ).hexdigest()[:16]
+
+              target = (
+                  f"{registry}/{prefix}/"
+                  f"image-{digest}:offline"
+              )
+
+              mapping[source] = target
+
+          def replace_images(obj):
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      if key == "image" and value in mapping:
+                          obj[key] = mapping[value]
+                      else:
+                          replace_images(value)
+              elif isinstance(obj, list):
+                  for item in obj:
+                      replace_images(item)
+
+          for document in documents:
+              replace_images(document)
+
+          with (bundle / "install-offline.yaml").open("w") as f:
+              yaml.safe_dump_all(
+                  documents,
+                  f,
+                  sort_keys=False,
+                  explicit_start=True
+              )
+
+          with (bundle / "images.txt").open("w") as f:
+              for source in sorted(mapping):
+                  f.write(source + "\n")
+
+          with (bundle / "image-map.tsv").open("w") as f:
+              for source, target in sorted(mapping.items()):
+                  f.write(f"{source}\t{target}\n")
+
+          print(f"Unique images: {len(mapping)}")
+
+          for source, target in sorted(mapping.items()):
+              print(f"{source} -> {target}")
+          PY
+
+      - name: Pull unique images
+        shell: bash
+        run: |
+          set -euo pipefail
+
           while IFS= read -r image; do
-            echo "Pulling $image for $PLATFORM"
-            docker pull --platform "$PLATFORM" "$image"
+            echo "Pulling: $image"
+
+            docker pull \
+              --platform linux/amd64 \
+              "$image"
+
           done < bundle/images.txt
-          mapfile -t images < bundle/images.txt
-          docker save --output bundle/kyverno-images.tar "${images[@]}"
-          sha256sum bundle/kyverno-images.tar > bundle/SHA256SUMS
 
-      - name: Add offline installation tooling
-        run: |
-          cp scripts/install-offline.sh bundle/install-offline.sh
-          cp scripts/helm-image-rewriter.py bundle/helm-image-rewriter.py
-          cp scripts/collect-images.py bundle/collect-images.py
-          cp README-offline.md bundle/README.md
-          chmod +x bundle/install-offline.sh bundle/helm-image-rewriter.py
-
-      - name: Create single ZIP
+      - name: Create single image TAR
+        shell: bash
         run: |
           set -euo pipefail
-          (cd bundle && zip -q -0 -r ../kyverno-offline-bundle.zip .)
-          unzip -t kyverno-offline-bundle.zip
-          ls -lh kyverno-offline-bundle.zip
 
-      - name: Upload exactly one bundle artifact
+          mapfile -t IMAGES < bundle/images.txt
+
+          docker save \
+            -o bundle/images.tar \
+            "${IMAGES[@]}"
+
+          test -s bundle/images.tar
+
+      - name: Create offline load and push script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > bundle/load-and-push.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          cd "$(dirname "$0")"
+
+          echo "Loading offline images..."
+          docker load -i images.tar
+
+          while IFS=$'\t' read -r source target; do
+            echo "Tagging $source -> $target"
+
+            docker tag "$source" "$target"
+
+            echo "Pushing $target"
+            docker push "$target"
+
+          done < image-map.tsv
+
+          echo "All images pushed successfully."
+          EOF
+
+          chmod +x bundle/load-and-push.sh
+
+      - name: Validate bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import yaml
+
+          with open("bundle/install-offline.yaml") as f:
+              docs = list(yaml.safe_load_all(f))
+
+          assert docs, "Offline manifest is empty"
+
+          with open("bundle/images.txt") as f:
+              images = [line.strip() for line in f if line.strip()]
+
+          assert len(images) == len(set(images)), \
+              "Duplicate images found"
+
+          print("Manifest valid")
+          print("Unique images:", len(images))
+          PY
+
+      - name: Build single ZIP bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_NAME="kyverno-offline-${KYVERNO_VERSION}.zip"
+
+          cd bundle
+          zip -q -9 "../${ZIP_NAME}" \
+            install.yaml \
+            install-offline.yaml \
+            images.tar \
+            images.txt \
+            image-map.tsv \
+            load-and-push.sh
+
+          cd ..
+
+          ls -lh "${ZIP_NAME}"
+
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: kyverno-offline-bundle
-          path: kyverno-offline-bundle.zip
-          if-no-files-found: error
+          path: kyverno-offline-${{ env.KYVERNO_VERSION }}.zip
           retention-days: 7
           compression-level: 0
+          if-no-files-found: error
