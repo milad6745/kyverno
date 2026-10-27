@@ -127,4 +127,63 @@ oom_score = 0
       [plugins."io.containerd.grpc.v1.cri".registry.configs."10.233.52.98:8082".tls]
         insecure_skip_verify = true
 ```
+apply deployment
+```
+kubectl apply -f deployment-new.yaml
+```
+check pod
+```
+kubectl get pods -n kyverno -o wide
+NAME                                            READY   STATUS    RESTARTS   AGE     IP               NODE     NOMINATED NODE   READINESS GATES
+kyverno-admission-controller-6dbcb964c5-x8mwx   1/1     Running   0          3h25m   10.233.103.139   worker   <none>           <none>
+kyverno-background-controller-989f9f6dc-jznbb   1/1     Running   0          3h25m   10.233.103.144   worker   <none>           <none>
+kyverno-cleanup-controller-b4646864d-cq5hr      1/1     Running   0          3h25m   10.233.103.189   worker   <none>           <none>
+kyverno-reports-controller-5c5fc76b55-vzk8v     1/1     Running   0          3h25m   10.233.103.173   worker   <none>           <none>
+```
+بعد از اجرای kyverno میایم و برایش یک require policy مینویسیم :
+
+```
+cat require-label.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-app-label
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: check-app-label
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - kyverno-test
+      validate:
+        message: "Pod must have an app label."
+        pattern:
+          metadata:
+            labels:
+              app: "?*"
+```
+```
+kubectl apply -f require-label.yaml
+```
+create a new pod and admission webhook denie the request
+```
+ kubectl get clusterpolicies.kyverno.io
+NAME                ADMISSION   BACKGROUND   VALIDATE ACTION   READY   AGE   MESSAGE
+require-app-label   true        false        Enforce           True    33s   Ready
+```
+```
+kubectl run test-no-label   --image=192.168.72.60:32082/kyverno/kyverno:v1.11.1   --restart=Never   -n kyverno-test
+Error from server: admission webhook "validate.kyverno.svc-fail" denied the request:
+
+resource Pod/kyverno-test/test-no-label was blocked due to the following policies
+
+require-app-label:
+  check-app-label: 'validation error: Pod must have an app label. rule check-app-label
+    failed at path /metadata/labels/app/'
+```
 
