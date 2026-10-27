@@ -63,5 +63,68 @@ do
   docker push ${REGISTRY}/kyverno/${IMAGE}:v1.11.1
 done
 ```
+hala deployment ro apply mikonim
+bad az apply kardan error mikhore ke image haro nemitone begire
+baraye ine ke nexus man http ast baraye in moshkel bayad be containerd begam be url nexus man chie 
 
+```bash
+cat  /etc/containerd/config.toml
+version = 2
+root = "/var/lib/containerd"
+state = "/run/containerd"
+oom_score = 0
+
+[grpc]
+  max_recv_message_size = 16777216
+  max_send_message_size = 16777216
+
+[debug]
+  level = "info"
+
+[metrics]
+  address = ""
+  grpc_histogram = false
+
+[plugins]
+
+  [plugins."io.containerd.grpc.v1.cri"]
+    sandbox_image = "registry.k8s.io/pause:3.8"
+    max_container_log_line_size = -1
+    enable_unprivileged_ports = false
+    enable_unprivileged_icmp = false
+
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+      snapshotter = "overlayfs"
+
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          base_runtime_spec = "/etc/containerd/cri-base.json"
+
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            systemdCgroup = true
+
+    # ================= REGISTRY CONFIG =================
+    [plugins."io.containerd.grpc.v1.cri".registry]
+
+      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+
+        # Docker Hub
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+          endpoint = ["https://registry-1.docker.io"]
+
+        # Existing private HTTP registry (preserved)
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."10.233.52.98:8082"]
+          endpoint = ["http://10.233.52.98:8082"]
+
+        # Nexus Kyverno Docker HTTP registry (NodePort 32082)
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."192.168.72.60:32082"]
+          endpoint = ["http://192.168.72.60:32082"]
+
+      # Existing private registry TLS setting (preserved)
+      [plugins."io.containerd.grpc.v1.cri".registry.configs."10.233.52.98:8082".tls]
+        insecure_skip_verify = true
+```
 
